@@ -1,0 +1,141 @@
+%% Setup
+clear; clc; close all;
+% Force close any existing serial connections before opening a new one
+
+%delete(serialportfind);
+%clear arduinoObj;
+
+% Setup Serial Communication
+%arduinoPort = "COM9";  % Change if necessary
+%baudRate = 115200;
+%arduinoObj = serialport(arduinoPort, baudRate);
+
+%% Audio To Inputs
+
+% Get audio file
+Fl = "C:\Users\james\Documents\MATLAB\Calibration_Spectral.wav";
+[Au, fs] = audioread(Fl); % Read Audio and Sample Rate
+Au_signal = mean(Au,2);  % Convert to Mono
+
+% Create Audio Player
+player = audioplayer(Au, fs);
+
+% Frequency Band Definitions
+HPF = [10, 70, 250, 1000, 3000, 6000]; % High-pass frequencies
+LPF = [70, 250, 1000, 3000, 6000, fs/2-1]; % Low-pass frequencies
+
+if length(HPF) == length(LPF)
+    bandNum = length(HPF);
+else
+    error("Error: HPF and LPF arrays must be of equal length. Script terminated.");
+end
+
+% Preallocate Band Levels
+bandLevels = zeros(bandNum, size(Au,1));
+
+% Apply Bandpass Filtering with Gaussian Smoothing
+for i = 1:bandNum
+    % Design Bandpass Filter
+    BPF = designfilt('bandpassiir', 'FilterOrder', 20, ...
+        'HalfPowerFrequency1', HPF(i), 'HalfPowerFrequency2', LPF(i), 'SampleRate', fs);
+    
+    audioFilt = filtfilt(BPF, Au_signal); % Apply Bandpass Filtering
+    bandLevels(i, :) = smoothdata(abs(audioFilt(:)), 'gaussian', round(0.1 * fs)); % Apply Gaussian Smoothing
+end
+
+% Processing
+limiterMax = 255; % Maximum output value
+gain = 1; % Nonlinear distortion
+downsampleFactor = 200; % Downsampling
+fs_new = fs / downsampleFactor; % Downsampled sample rate
+
+% Define Soft Clipping Function
+smoothClip = @(x, inpMax, outMax) outMax * clip(1.5 * (inpMax^2 * x - (1/3) * x.^3) / inpMax^3, 0, 1);
+
+% Downsample and Apply Clipping
+bandLevels = bandLevels(:, 1:downsampleFactor:end);
+bandLevels = smoothClip(gain * bandLevels, 1, limiterMax);
+bandLevels = floor(bandLevels);
+
+% Plot Results
+colors = ['m', 'r', 'y', 'g', 'b', 'k'];
+figure; hold on;
+time = (0:1:length(bandLevels)-1) / fs_new;
+legend({'Band 1', 'Band 2', 'Band 3', 'Band 4', 'Band 5', 'Band 6'});
+for k = 1:bandNum
+    plot(time, bandLevels(k,:), colors(k), 'LineWidth', 2);
+end
+xlabel('Time');
+ylabel('Brightness Level');
+title('Real-Time LED Brightness');
+ylim([0 limiterMax]);
+
+disp("Streaming brightness levels to Arduino...");
+
+
+%% Arduino Communication
+
+% Wait for synchronization
+disp("Waiting for Arduino signal...");
+
+while true % Loop Checking for START
+    numBytes = arduinoObj.NumBytesAvailable;
+    if numBytes > 0 % Look for message
+        data = readline(arduinoObj); % Read message
+        disp("Received: " + data);
+
+        if strcmp(strtrim(data), "START") % Read START signal
+            disp("Arduino Ready! Measuring Audio Start Time...");
+            tic;
+            play(player);
+            pause(1.1);  % Allow playback to start
+            
+            % Wait until audio actually starts
+            while ~isplaying(player)
+                pause(0.001);
+            end
+            disp("Audio has started!");
+            
+            tic; % Reset timer
+            break;
+        end
+    end
+    pause(0.2);
+end
+
+pause(0.0001);
+
+%% Stream Brightness Levels to Arduino
+sample = 1;
+timeLog = zeros(1, length(bandLevels));  % Store loop execution times
+pause(0.14);
+
+while sample < length(bandLevels)
+    elapsedTime = toc;  % Get time since loop started
+    expectedTime = sample / fs_new;  % Expected playback time
+
+    % Adjust delay dynamically
+    delayTime = expectedTime - elapsedTime;
+    if delayTime > 0
+        pause(delayTime);
+    end
+
+    % Send All Band Levels as One Message
+    bandDataString = strjoin(string(bandLevels(:, sample))', ',');
+    writeline(arduinoObj, bandDataString);
+    fprintf("Sent: %s\r", bandDataString);
+
+    % Log Execution Time
+    timeLog(sample) = toc;
+    sample = sample + 1;
+end
+
+disp("Finished sending brightness values!");
+
+%% Debugging: Plot Execution Time Log
+figure;
+plot(timeLog, 'b', 'LineWidth', 2);
+xlabel('Sample Index');
+ylabel('Elapsed Time (s)');
+title('Execution Time per Sample');
+grid on;
